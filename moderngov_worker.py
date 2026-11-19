@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 UK COUNCIL VOTEWATCH — AUTOMATED MODERN.GOV INGESTION PIPELINE
-Uses Chrome TLS/HTTP2 impersonation (curl_cffi) + XML/HTML dual roster extraction.
+1. sync-roster        -> Syncs councillors & date-stamped tenures via Modern.Gov XML/HTML
+2. crawl-divisions    -> Pulls 2019–2026 Council meetings & minutes via Modern.Gov XML + PDF/HTML
+3. generate-briefings -> Generates 4-part journalistic briefings with Google Search grounding
+4. full-sync          -> Runs all three stages sequentially
 """
 
 import argparse
+import html
 import io
 import json
 import logging
@@ -41,9 +45,8 @@ logging.basicConfig(
 log = logging.getLogger("votewatch-worker")
 
 BROWSER_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 KNOWN_COUNCIL_CIDS = {
@@ -54,8 +57,7 @@ KNOWN_COUNCIL_CIDS = {
 def create_http_session() -> cffi_requests.Session:
     proxy = os.environ.get("PROXY_URL")
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    session = cffi_requests.Session(impersonate="chrome", headers=BROWSER_HEADERS, proxies=proxies)
-    return session
+    return cffi_requests.Session(impersonate="chrome", headers=BROWSER_HEADERS, proxies=proxies)
 
 
 def get_db_connection():
@@ -63,7 +65,14 @@ def get_db_connection():
     if not db_url:
         log.error("DATABASE_URL environment variable is missing.")
         sys.exit(1)
-    return psycopg.connect(db_url, row_factory=dict_row)
+    return psycopg.connect(db_url.strip(), row_factory=dict_row)
+
+
+def normalize_ward_key(name: str) -> str:
+    """Strips trailing 'Ward' and apostrophes so 'Belfairs Ward' == 'Belfairs' and 'St Lukes Ward' == 'St Luke's'."""
+    s = (name or "").lower().replace("’", "").replace("'", "").strip()
+    s = re.sub(r"\s+ward$", "", s).strip()
+    return s
 
 
 def normalize_party_and_group(raw_party: str) -> Tuple[str, str]:
@@ -87,7 +96,7 @@ def normalize_party_and_group(raw_party: str) -> Tuple[str, str]:
 
 
 def generate_name_aliases(full_name: str) -> List[str]:
-    clean = re.sub(r"^(Councillor|Cllr|Dr|Prof|Rev|Sir|Dame)\s+", "", full_name.strip(), flags=re.I)
+    clean = re.sub(r"^(Councillor|Cllr|Doctor|Dr|Prof|Rev|Sir|Dame)\s+", "", full_name.strip(), flags=re.I)
     clean = clean.replace("’", "'")
     parts = clean.split()
     aliases = {full_name.strip(), clean}
@@ -96,6 +105,8 @@ def generate_name_aliases(full_name: str) -> List[str]:
         first_initial = parts[0][0]
         aliases.add(surname)
         aliases.add(f"{first_initial} {surname}")
+        if "doctor" in full_name.lower() or "dr " in full_name.lower():
+            aliases.add(f"Dr {surname}")
         if len(parts) >= 3:
             initials = " ".join(p[0] for p in parts[:-1])
             aliases.add(f"{initials} {surname}")
@@ -116,15 +127,19 @@ def classify_motion_category(title: str, context: str = "") -> str:
     return "Governance & Civic"
 
 
-# =========================================================================
-# STAGE 1: MODERN.GOV ROSTER & TENURE SYNCER (XML + HTML TABLE FALLBACK)
-# =========================================================================
-def parse_moderngov_xml_councillors(xml_bytes: bytes) -> List[Dict[str, Any]]:
+def strip_xml_namespaces(xml_bytes: bytes) -> ET.Element:
     root = ET.fromstring(xml_bytes)
     for elem in root.iter():
         if "}" in elem.tag:
             elem.tag = elem.tag.split("}", 1)[1]
+    return root
 
+
+# =========================================================================
+# STAGE 1: MODERN.GOV ROSTER & TENURE SYNCER
+# =========================================================================
+def parse_moderngov_xml_councillors(xml_bytes: bytes) -> List[Dict[str, Any]]:
+    root = strip_xml_namespaces(xml_bytes)
     results = []
     for ward_el in root.findall(".//ward"):
         ward_name = (ward_el.findtext("wardtitle") or "").strip()
@@ -150,40 +165,6 @@ def parse_moderngov_xml_councillors(xml_bytes: bytes) -> List[Dict[str, Any]]:
     return results
 
 
-def parse_moderngov_html_councillors(html_text: str) -> List[Dict[str, Any]]:
-    """Parses Modern.Gov mgMemberIndex.aspx?VW=TABLE&PIC=0 HTML table."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    results = []
-    for tr in soup.find_all("tr"):
-        user_link = tr.find("a", href=re.compile(r"mgUserInfo\.aspx\?UID=\d+", re.I))
-        if not user_link:
-            continue
-        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-        if len(cells) < 3:
-            continue
-        m_uid = re.search(r"UID=(\d+)", user_link["href"], re.I)
-        uid = m_uid.group(1) if m_uid else ""
-        full_name = re.sub(r"^(Councillor|Cllr)\s+", "", user_link.get_text(" ", strip=True), flags=re.I).strip()
-
-        # Standard Modern.Gov columns: Name | Party | Ward | Term of Office
-        party = cells[1] if len(cells) > 1 else ""
-        ward = cells[2] if len(cells) > 2 else ""
-        term_str = cells[3] if len(cells) > 3 else ""
-        years = re.findall(r"(20\d{2})", term_str)
-        next_year = int(years[-1]) if years else None
-
-        if full_name and ward:
-            results.append({
-                "external_cms_id": uid or full_name.lower().replace(" ", "-"),
-                "canonical_name": full_name,
-                "ward_name": ward,
-                "raw_party": party,
-                "photo_url": None,
-                "next_election_year": next_year,
-            })
-    return results
-
-
 def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[str, Any]):
     ons_code = authority["ons_code"]
     base_url = authority["base_url"].rstrip("/")
@@ -193,7 +174,7 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
     xml_url = f"{base_url}/mgWebService.asmx/GetCouncillorsByWard"
     try:
         resp = session.get(xml_url, timeout=30)
-        log.info(f"[{ons_code}] XML endpoint status: HTTP {resp.status_code}")
+        log.info(f"[{ons_code}] XML GetCouncillorsByWard status: HTTP {resp.status_code}")
         if resp.status_code == 200 and b"<" in resp.content:
             councillors_data = parse_moderngov_xml_councillors(resp.content)
             log.info(f"[{ons_code}] Retrieved {len(councillors_data)} councillors via Modern.Gov XML API.")
@@ -201,33 +182,21 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
         log.warning(f"[{ons_code}] XML endpoint error: {exc}")
 
     if not councillors_data:
-        html_url = f"{base_url}/mgMemberIndex.aspx?VW=TABLE&PIC=0"
-        try:
-            resp = session.get(html_url, timeout=30)
-            log.info(f"[{ons_code}] HTML directory status: HTTP {resp.status_code}")
-            if resp.status_code == 200:
-                councillors_data = parse_moderngov_html_councillors(resp.text)
-                log.info(f"[{ons_code}] Retrieved {len(councillors_data)} councillors via HTML directory.")
-            elif resp.status_code == 403:
-                log.error(f"[{ons_code}] WAF blocked request (HTTP 403). If running from cloud CI, set PROXY_URL or run locally.")
-        except Exception as exc:
-            log.warning(f"[{ons_code}] HTML directory error: {exc}")
-
-    if not councillors_data:
         log.warning(f"[{ons_code}] No councillors extracted. Skipping roster update.")
         return
 
     with conn.cursor() as cur:
         cur.execute("SELECT ons_ward_code, name FROM wards WHERE authority_ons_code = %s", (ons_code,))
-        ward_lookup = {row["name"].lower().replace("’", "'"): row["ons_ward_code"] for row in cur.fetchall()}
+        ward_lookup = {normalize_ward_key(row["name"]): row["ons_ward_code"] for row in cur.fetchall()}
 
         today_str = date.today().isoformat()
+        synced_count = 0
 
         for item in councillors_data:
-            ward_key = item["ward_name"].lower().replace("’", "'")
+            ward_key = normalize_ward_key(item["ward_name"])
             ward_id = ward_lookup.get(ward_key)
             if not ward_id:
-                log.warning(f"[{ons_code}] Unmapped ward '{item['ward_name']}' for {item['canonical_name']}")
+                log.warning(f"[{ons_code}] Unmapped ward '{item['ward_name']}' (key='{ward_key}') for {item['canonical_name']}")
                 continue
 
             cms_id = item["external_cms_id"]
@@ -280,13 +249,14 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
                     """,
                     (cllr_id, ward_id, party_name, group_name, "2019-05-01", item["next_election_year"]),
                 )
+            synced_count += 1
 
     conn.commit()
-    log.info(f"[{ons_code}] Roster & tenures synchronized ({len(councillors_data)} members).")
+    log.info(f"[{ons_code}] Roster & tenures synchronized ({synced_count} members mapped to wards).")
 
 
 # =========================================================================
-# STAGE 2: 2019–2026 MINUTES CRAWLER & RECORDED DIVISION PARSER
+# STAGE 2: 2019–2026 MINUTES CRAWLER (XML WEB SERVICE + PDF/HTML FALLBACK)
 # =========================================================================
 DIVISION_BLOCK_REGEX = re.compile(
     r"(For\s*:\s*Councillors?.*?)\n+"
@@ -330,19 +300,83 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(pages_text)
 
 
-def discover_council_committee_ids(session: cffi_requests.Session, base_url: str, ons_code: str) -> List[int]:
-    if ons_code in KNOWN_COUNCIL_CIDS:
-        return KNOWN_COUNCIL_CIDS[ons_code]
-    resp = session.get(f"{base_url}/mgListCommittees.aspx", timeout=30)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    cids = []
-    for a in soup.find_all("a", href=re.compile(r"mgCommitteeDetails\.aspx\?ID=\d+", re.I)):
-        label = a.get_text(" ", strip=True).lower()
-        if label in ("the council", "full council", "council"):
-            m = re.search(r"ID=(\d+)", a["href"], re.I)
-            if m:
-                cids.append(int(m.group(1)))
-    return sorted(set(cids)) or [131]
+def parse_flexible_date(raw_dt: str) -> Optional[date]:
+    clean = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", (raw_dt or "").strip())
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(clean[:20].strip(), fmt).date()
+        except ValueError:
+            continue
+    m = re.search(r"(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})", clean)
+    if m:
+        return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date()
+    return None
+
+
+def fetch_meetings_via_xml(session: cffi_requests.Session, base_url: str, cids: List[int], start_year: int, end_year: int) -> List[Dict[str, Any]]:
+    """Uses Modern.Gov /mgWebService.asmx/GetMeetings (bypasses HTML page WAF)."""
+    meetings = {}
+    s_from = f"01/01/{start_year}"
+    s_to = f"31/12/{end_year}"
+
+    for cid in cids:
+        url = f"{base_url}/mgWebService.asmx/GetMeetings?lCommitteeId={cid}&sFromDate={s_from}&sToDate={s_to}"
+        try:
+            resp = session.get(url, timeout=30)
+            log.info(f"XML GetMeetings (CId={cid}) status: HTTP {resp.status_code}")
+            if resp.status_code != 200 or b"<" not in resp.content:
+                continue
+            root = strip_xml_namespaces(resp.content)
+            for m_el in root.findall(".//meeting"):
+                mid = (m_el.findtext("meetingid") or "").strip()
+                raw_date = (m_el.findtext("meetingdate") or "").strip()
+                title = (m_el.findtext("meetingtitle") or m_el.findtext("committeetitle") or "The Council").strip()
+                m_dt = parse_flexible_date(raw_date)
+                if mid and m_dt:
+                    meetings[mid] = {
+                        "mid": mid,
+                        "meeting_date": m_dt,
+                        "title": title,
+                        "source_url": f"{base_url}/ieListDocuments.aspx?CId={cid}&MId={mid}",
+                    }
+        except Exception as exc:
+            log.warning(f"XML GetMeetings error (CId={cid}): {exc}")
+
+    return sorted(meetings.values(), key=lambda x: x["meeting_date"])
+
+
+def fetch_minutes_text_via_xml(session: cffi_requests.Session, base_url: str, mid: str) -> Tuple[str, Optional[str]]:
+    """Uses Modern.Gov /mgWebService.asmx/GetMeeting to extract inline minutes text & PDF links."""
+    url = f"{base_url}/mgWebService.asmx/GetMeeting?lMeetingId={mid}"
+    resp = session.get(url, timeout=30)
+    if resp.status_code != 200 or b"<" not in resp.content:
+        return ("", None)
+
+    root = strip_xml_namespaces(resp.content)
+    chunks = []
+    pdf_url = None
+
+    for item in root.findall(".//agendaitem"):
+        num = (item.findtext("agendaitemnumber") or "").strip()
+        title = (item.findtext("agendaitemtitle") or "").strip()
+        if num or title:
+            chunks.append(f"{num}. {title}".strip())
+
+        raw_min = item.findtext("minutestext") or ""
+        if raw_min:
+            unescaped = html.unescape(raw_min)
+            plain = BeautifulSoup(unescaped, "html.parser").get_text("\n")
+            chunks.append(plain)
+
+    for doc in root.findall(".//document"):
+        d_title = (doc.findtext("title") or "").lower()
+        d_url = (doc.findtext("url") or "").strip()
+        if d_url and ("minute" in d_title or "printed minutes" in d_title):
+            pdf_url = urljoin(base_url + "/", d_url)
+            break
+
+    combined_text = "\n\n".join(c.strip() for c in chunks if c.strip())
+    return (combined_text, pdf_url)
 
 
 def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: Dict[str, Any], start_year: int = 2019, end_year: int = 2026):
@@ -377,64 +411,22 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    cids = discover_council_committee_ids(session, base_url, ons_code)
-    meeting_links = {}
+    cids = KNOWN_COUNCIL_CIDS.get(ons_code, [131])
+    meetings = fetch_meetings_via_xml(session, base_url, cids, start_year, end_year)
+    log.info(f"[{ons_code}] Found {len(meetings)} Council meetings ({start_year}–{end_year}).")
 
-    for cid in cids:
-        for yr in range(start_year, end_year + 1):
-            list_url = f"{base_url}/ieListMeetings.aspx?CId={cid}&Year={yr}"
-            try:
-                resp = session.get(list_url, timeout=30)
-                if resp.status_code != 200:
-                    log.warning(f"[{ons_code}] Year {yr} returned HTTP {resp.status_code}")
-                    continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for a in soup.find_all("a", href=re.compile(r"ieListDocuments\.aspx\?CId=\d+&MId=\d+", re.I)):
-                    href = urljoin(base_url + "/", a["href"])
-                    m_mid = re.search(r"MId=(\d+)", href, re.I)
-                    if m_mid:
-                        meeting_links[m_mid.group(1)] = href
-            except Exception as exc:
-                log.warning(f"[{ons_code}] Failed listing year {yr}: {exc}")
-
-    log.info(f"[{ons_code}] Found {len(meeting_links)} candidate Council meetings ({start_year}–{end_year}).")
-
-    for mid, doc_url in sorted(meeting_links.items()):
+    for mtg in meetings:
+        mid = mtg["mid"]
+        meeting_dt = mtg["meeting_date"]
         try:
-            m_resp = session.get(doc_url, timeout=30)
-            if m_resp.status_code != 200:
-                continue
-            m_soup = BeautifulSoup(m_resp.text, "html.parser")
-            page_title = m_soup.title.get_text(" ", strip=True) if m_soup.title else "The Council"
+            minutes_text, pdf_url = fetch_minutes_text_via_xml(session, base_url, mid)
+            minutes_source_url = pdf_url or mtg["source_url"]
 
-            date_match = re.search(
-                r"(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
-                m_soup.get_text(" "),
-            )
-            if not date_match:
-                continue
-            dt_str = f"{date_match.group(1)} {date_match.group(2)} {date_match.group(3)}"
-            meeting_dt = datetime.strptime(dt_str, "%d %B %Y").date()
-
-            minutes_text = ""
-            minutes_source_url = doc_url
-            for link in m_soup.find_all("a", href=True):
-                txt = link.get_text(" ", strip=True).lower()
-                href = link["href"]
-                if ("minute" in txt or "printed minutes" in txt) and (".pdf" in href.lower() or "mgconvert2pdf" in href.lower()):
-                    minutes_source_url = urljoin(base_url + "/", href)
-                    pdf_resp = session.get(minutes_source_url, timeout=45)
-                    if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
-                        minutes_text = extract_text_from_pdf(pdf_resp.content)
-                        break
-
-            if not minutes_text:
-                for link in m_soup.find_all("a", href=re.compile(r"mgAi\.aspx\?ID=\d+", re.I)):
-                    if "minute" in link.get_text(" ", strip=True).lower():
-                        ai_url = urljoin(base_url + "/", link["href"])
-                        ai_resp = session.get(ai_url, timeout=30)
-                        if ai_resp.status_code == 200:
-                            minutes_text += "\n" + BeautifulSoup(ai_resp.text, "html.parser").get_text("\n")
+            # If inline XML minutes didn't contain division lists, try downloading the Minutes PDF
+            if (not minutes_text or not DIVISION_BLOCK_REGEX.search(minutes_text)) and pdf_url:
+                pdf_resp = session.get(pdf_url, timeout=45)
+                if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
+                    minutes_text = extract_text_from_pdf(pdf_resp.content)
 
             if not minutes_text:
                 continue
@@ -455,7 +447,7 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
                         scraped_at = NOW()
                     RETURNING id
                     """,
-                    (ons_code, mid, page_title[:120], meeting_dt, minutes_source_url),
+                    (ons_code, mid, mtg["title"][:120], meeting_dt, minutes_source_url),
                 )
                 meeting_uuid = cur.fetchone()["id"]
 
@@ -583,7 +575,7 @@ def generate_missing_briefings(conn, limit: int = 25):
         log.info("GEMINI_API_KEY not set; skipping AI journalistic briefing generation.")
         return
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key.strip())
 
     with conn.cursor() as cur:
         cur.execute(
