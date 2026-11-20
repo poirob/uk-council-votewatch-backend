@@ -3,7 +3,7 @@
 UK COUNCIL VOTEWATCH — AUTOMATED MODERN.GOV INGESTION PIPELINE
 1. sync-roster        -> Syncs councillors & date-stamped tenures via Modern.Gov XML
 2. crawl-divisions    -> Pulls 2019–2026 Council meetings & minutes via Modern.Gov XML + PDF fallback
-3. generate-briefings -> Generates 4-part journalistic briefings with Google Search grounding
+3. generate-briefings -> Generates 4-part journalistic briefings with automatic free-tier rate pacing
 4. full-sync          -> Runs all three stages sequentially
 """
 
@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -266,13 +267,12 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
 # =========================================================================
 # STAGE 2: 2019–2026 MINUTES CRAWLER & RECORDED DIVISION PARSER
 # =========================================================================
-# Supports both plain "For: Cllrs..." and descriptive "For the amendment: Cllrs..." / "For reference back: Cllrs..."
 DIVISION_BLOCK_REGEX = re.compile(
     r"((?:Votes\s+)?For(?:\s+[A-Za-z0-9'’\-]+){0,6}(?:\s*\(\d+\))?\s*:\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
     r"((?:Votes\s+)?Against(?:\s+[A-Za-z0-9'’\-]+){0,6}(?:\s*\(\d+\))?\s*:\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
     r"(Abst(?:entions?|ain)(?:\s+[A-Za-z0-9'’\-]+){0,4}(?:\s*\(\d+\))?\s*:\s*.*?)"
-    r"(?:\n+(No\s+Vote(?:\s*\(\d+\))?\s*:\s*.*?))?"
-    r"(?:\n+(Absent(?:\s+for\s+the\s+vote)?(?:\s*\(\d+\))?\s*:\s*.*?))?"
+    r"(?:\n+(No\s+Vote(?:\s*\(\d+\))?\s*:?\s*.*?))?"
+    r"(?:\n+(Absent(?:\s+for\s+the\s+vote)?(?:\s*\(\d+\))?\s*:?\s*.*?))?"
     r"(?=\n\n|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -613,7 +613,7 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
 
 
 # =========================================================================
-# STAGE 3: GEMINI SEARCH-GROUNDED JOURNALISTIC BRIEFING GENERATOR
+# STAGE 3: GEMINI JOURNALISTIC BRIEFING GENERATOR (PACED + FREE-TIER FALLBACK)
 # =========================================================================
 def generate_missing_briefings(conn, limit: int = 60):
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -626,7 +626,7 @@ def generate_missing_briefings(conn, limit: int = 60):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT d.id, d.title, d.minute_ref, d.outcome, d.expected_tallies, d.parsed_tallies,
+            SELECT d.id, d.title, d.minute_ref, d.outcome, d.raw_text, d.expected_tallies,
                    m.meeting_date, a.name AS authority_name
             FROM divisions d
             JOIN meetings m ON m.id = d.meeting_id
@@ -644,9 +644,16 @@ def generate_missing_briefings(conn, limit: int = 60):
         log.info("All extracted divisions already have journalistic briefings.")
         return
 
-    log.info(f"Generating Google Search-grounded journalistic briefings for {len(pending)} division(s)...")
+    log.info(f"Generating journalistic briefings for {len(pending)} division(s)...")
 
-    for div in pending:
+    grounding_enabled = True
+    primary_exhausted = False
+
+    for idx, div in enumerate(pending):
+        if idx > 0:
+            # Pace under 15 RPM (Flash-Lite limit) or 5 RPM (3.8 Flash limit)
+            time.sleep(4.5 if primary_exhausted else 12.5)
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -661,7 +668,7 @@ def generate_missing_briefings(conn, limit: int = 60):
 
         rebels = [f"Cllr {r['canonical_name']} ({r['group_at_vote']}) voted {r['vote_cast'].upper()}" for r in vote_rows if r["is_rebel"]]
         prompt = f"""You are a British local government political journalist covering {div['authority_name']}.
-Use Google Search to find verified local news, council reports, or petitions relating to this recorded council vote, and combine that context with the exact mathematical voting record below:
+Analyse the recorded council vote below and combine it with local British local government context:
 
 Authority: {div['authority_name']}
 Meeting Date: {div['meeting_date']} (Minute {div['minute_ref']})
@@ -669,6 +676,8 @@ Motion Title: {div['title']}
 Outcome: {div['outcome']}
 Tallies: {json.dumps(div['expected_tallies'])}
 Party Whip Deviations / Rebels: {', '.join(rebels) if rebels else 'None'}
+Official Minute Record:
+{(div['raw_text'] or '')[:1800]}
 
 Return ONLY a valid JSON object (no markdown fences) with these exact 5 keys in objective British English:
 {{
@@ -679,23 +688,65 @@ Return ONLY a valid JSON object (no markdown fences) with these exact 5 keys in 
   "anatomy_of_split": "Breakdown of how each party group voted, naming any rebels or abstainers"
 }}"""
 
+        response = None
+
+        # 1. Try grounded gemini-3.8-flash (works automatically on paid Tier 1 keys)
+        if grounding_enabled and not primary_exhausted:
+            try:
+                response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.3,
+                    ),
+                )
+            except Exception as exc:
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    log.info("Google Search grounding unavailable on current tier; switching to standard synthesis.")
+                    grounding_enabled = False
+                else:
+                    log.warning(f"Grounded request error for {div['id']}: {exc}")
+
+        # 2. Try ungrounded gemini-3.8-flash (free tier: 5 RPM, 20 RPD)
+        if response is None and not primary_exhausted:
+            try:
+                response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.3),
+                )
+            except Exception as exc:
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    log.info("gemini-3.8-flash free daily quota reached; routing remaining divisions to gemini-3.5-flash-lite.")
+                    primary_exhausted = True
+                else:
+                    log.warning(f"gemini-3.8-flash error for {div['id']}: {exc}")
+
+        # 3. Overflow to gemini-3.5-flash-lite (free tier: 15 RPM, 500 RPD)
+        if response is None:
+            try:
+                response = client.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.3),
+                )
+            except Exception as exc:
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    log.warning("All free-tier daily quotas exhausted for today; remaining briefings will run next cycle.")
+                    break
+                log.warning(f"Briefing generation failed for {div['id']}: {exc}")
+                continue
+
         try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.3,
-                ),
-            )
-            raw_text = response.text or ""
+            raw_text = (response.text if response else "") or ""
             match = re.search(r"\{[\s\S]*\}", raw_text)
             if not match:
                 continue
             brief = json.loads(match.group(0))
 
             citations = []
-            cand = response.candidates[0] if response.candidates else None
+            cand = response.candidates[0] if response and response.candidates else None
             if cand and getattr(cand, "grounding_metadata", None):
                 chunks = getattr(cand.grounding_metadata, "grounding_chunks", None) or []
                 for ch in chunks:
@@ -730,10 +781,10 @@ Return ONLY a valid JSON object (no markdown fences) with these exact 5 keys in 
                     ),
                 )
             conn.commit()
-            log.info(f"Generated briefing for {div['meeting_date']} Min {div['minute_ref']}")
-        except Exception as exc:
+            log.info(f"[{idx + 1}/{len(pending)}] Generated briefing for {div['meeting_date']} Min {div['minute_ref']}")
+        except Exception as db_exc:
             conn.rollback()
-            log.warning(f"Briefing generation failed for {div['id']}: {exc}")
+            log.warning(f"Database save failed for briefing {div['id']}: {db_exc}")
 
 
 # =========================================================================
