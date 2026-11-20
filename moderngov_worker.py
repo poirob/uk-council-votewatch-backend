@@ -615,7 +615,7 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
 # =========================================================================
 # STAGE 3: GEMINI SEARCH-GROUNDED JOURNALISTIC BRIEFING GENERATOR
 # =========================================================================
-def generate_missing_briefings(conn, limit: int = 30):
+def generate_missing_briefings(conn, limit: int = 60):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key or genai is None:
         log.info("GEMINI_API_KEY not set; skipping AI journalistic briefing generation.")
@@ -681,7 +681,7 @@ Return ONLY a valid JSON object (no markdown fences) with these exact 5 keys in 
 
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     tools=[types.Tool(google_search=types.GoogleSearch())],
