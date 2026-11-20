@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -95,7 +96,13 @@ def normalize_party_and_group(raw_party: str) -> Tuple[str, str]:
     return (p or "Independent", p or "Not Aligned")
 
 
-def generate_name_aliases(full_name: str) -> List[str]:
+def extract_surname(full_name: str) -> str:
+    clean = re.sub(r"^(Councillor|Cllr|Doctor|Dr|Prof|Rev|Sir|Dame)\s+", "", full_name.strip(), flags=re.I)
+    parts = clean.replace("’", "'").split()
+    return parts[-1].lower() if parts else ""
+
+
+def generate_name_aliases(full_name: str, allow_bare_surname: bool = True) -> List[str]:
     clean = re.sub(r"^(Councillor|Cllr|Doctor|Dr|Prof|Rev|Sir|Dame)\s+", "", full_name.strip(), flags=re.I)
     clean = clean.replace("’", "'")
     parts = clean.split()
@@ -103,8 +110,10 @@ def generate_name_aliases(full_name: str) -> List[str]:
     if len(parts) >= 2:
         surname = parts[-1]
         first_initial = parts[0][0]
-        aliases.add(surname)
+        if allow_bare_surname:
+            aliases.add(surname)
         aliases.add(f"{first_initial} {surname}")
+        aliases.add(f"{first_initial}. {surname}")
         if "doctor" in full_name.lower() or "dr " in full_name.lower():
             aliases.add(f"Dr {surname}")
         if len(parts) >= 3:
@@ -184,6 +193,8 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
         log.warning(f"[{ons_code}] No councillors extracted. Skipping roster update.")
         return
 
+    surname_counts = Counter(extract_surname(c["canonical_name"]) for c in councillors_data)
+
     with conn.cursor() as cur:
         cur.execute("SELECT ons_ward_code, name FROM wards WHERE authority_ons_code = %s", (ons_code,))
         ward_lookup = {normalize_ward_key(row["name"]): row["ons_ward_code"] for row in cur.fetchall()}
@@ -200,7 +211,8 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
 
             cms_id = item["external_cms_id"]
             party_name, group_name = normalize_party_and_group(item["raw_party"])
-            aliases = generate_name_aliases(item["canonical_name"])
+            s_name = extract_surname(item["canonical_name"])
+            aliases = generate_name_aliases(item["canonical_name"], allow_bare_surname=(surname_counts[s_name] == 1))
 
             cur.execute(
                 """
@@ -209,10 +221,7 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
                 ON CONFLICT (authority_code, external_cms_id) DO UPDATE SET
                     canonical_name = EXCLUDED.canonical_name,
                     photo_url = COALESCE(EXCLUDED.photo_url, councillors.photo_url),
-                    aliases = (
-                        SELECT jsonb_agg(DISTINCT val)
-                        FROM jsonb_array_elements_text(councillors.aliases || EXCLUDED.aliases) AS val
-                    )
+                    aliases = EXCLUDED.aliases
                 RETURNING id
                 """,
                 (ons_code, item["canonical_name"], cms_id, Jsonb(aliases), item["photo_url"]),
@@ -257,13 +266,13 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
 # =========================================================================
 # STAGE 2: 2019–2026 MINUTES CRAWLER & RECORDED DIVISION PARSER
 # =========================================================================
-# Matches both 'Councillors' and 'Cllrs', inline or multi-line, with or without count in header
+# Supports both plain "For: Cllrs..." and descriptive "For the amendment: Cllrs..." / "For reference back: Cllrs..."
 DIVISION_BLOCK_REGEX = re.compile(
-    r"((?:Votes\s+)?For(?:\s*\(\d+\))?\s*:?\s*(?:Councillors?|Cllrs?)\b.*?)\n+"
-    r"((?:Votes\s+)?Against(?:\s*\(\d+\))?\s*:?\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
-    r"(Abst(?:entions?|ain)(?:\s*\(\d+\))?\s*:?\s*.*?)"
-    r"(?:\n+(No\s+Vote(?:\s*\(\d+\))?\s*:?\s*.*?))?"
-    r"(?:\n+(Absent(?:\s+for\s+the\s+vote)?(?:\s*\(\d+\))?\s*:?\s*.*?))?"
+    r"((?:Votes\s+)?For(?:\s+[A-Za-z0-9'’\-]+){0,6}(?:\s*\(\d+\))?\s*:\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
+    r"((?:Votes\s+)?Against(?:\s+[A-Za-z0-9'’\-]+){0,6}(?:\s*\(\d+\))?\s*:\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
+    r"(Abst(?:entions?|ain)(?:\s+[A-Za-z0-9'’\-]+){0,4}(?:\s*\(\d+\))?\s*:\s*.*?)"
+    r"(?:\n+(No\s+Vote(?:\s*\(\d+\))?\s*:\s*.*?))?"
+    r"(?:\n+(Absent(?:\s+for\s+the\s+vote)?(?:\s*\(\d+\))?\s*:\s*.*?))?"
     r"(?=\n\n|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -274,13 +283,16 @@ def parse_bucket_line(line: str) -> Tuple[List[str], Optional[int]]:
         return ([], 0)
     flat = re.sub(r"\s+", " ", line).strip()
 
-    # Check tally either at start "For (26):" or end "... (26)"
-    m_head_cnt = re.match(r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)\s*\((\d+)\)", flat, flags=re.I)
+    m_head_cnt = re.match(
+        r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)(?:\s+[A-Za-z0-9'’\-]+){0,6}\s*\((\d+)\)",
+        flat,
+        flags=re.I,
+    )
     m_tail_cnt = re.search(r"\((\d+)\)\s*\.?\s*$", flat)
     expected = int(m_head_cnt.group(1)) if m_head_cnt else (int(m_tail_cnt.group(1)) if m_tail_cnt else None)
 
     body = re.sub(
-        r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)(?:\s*\(\d+\))?\s*:?\s*",
+        r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)(?:\s+[A-Za-z0-9'’\-]+){0,6}(?:\s*\(\d+\))?\s*:\s*",
         "",
         flat,
         flags=re.I,
@@ -354,7 +366,6 @@ def fetch_meetings_via_xml(session: cffi_requests.Session, base_url: str, cids: 
 
 
 def fetch_single_meeting_minutes(base_url: str, mtg: Dict[str, Any]) -> Dict[str, Any]:
-    """Thread-safe worker to fetch GetMeeting XML (and PDF fallback if needed) for one meeting."""
     session = create_http_session()
     mid = mtg["mid"]
     url = f"{base_url}/mgWebService.asmx/GetMeeting?lMeetingId={mid}"
@@ -373,7 +384,6 @@ def fetch_single_meeting_minutes(base_url: str, mtg: Dict[str, Any]) -> Dict[str
                 if num or title:
                     chunks.append(f"{num}. {title}".strip())
 
-                # Capture all minute/decision/vote fields regardless of Modern.Gov XML schema version
                 for child in item:
                     tag_low = child.tag.lower()
                     if any(k in tag_low for k in ("minute", "decision", "vote", "text")) and child.text:
@@ -391,7 +401,6 @@ def fetch_single_meeting_minutes(base_url: str, mtg: Dict[str, Any]) -> Dict[str
 
             minutes_text = "\n\n".join(chunks)
 
-        # Fallback to Minutes PDF if XML had no recorded division blocks
         if (not minutes_text or not DIVISION_BLOCK_REGEX.search(minutes_text)) and pdf_url:
             pdf_resp = session.get(pdf_url, timeout=45)
             if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
@@ -466,11 +475,6 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
 
         matches = list(DIVISION_BLOCK_REGEX.finditer(minutes_text))
         if not matches:
-            # Log diagnostic snippet if a recorded vote phrase exists but didn't match regex
-            rv = re.search(r"(recorded vote|voting was as follows|for\s*:)", minutes_text, flags=re.I)
-            if rv and "against" in minutes_text[rv.start():rv.start() + 600].lower():
-                snippet = re.sub(r"\s+", " ", minutes_text[rv.start():rv.start() + 260])
-                log.info(f"[{ons_code}] {meeting_dt} (MId={mid}) unparsed vote sample: {snippet}")
             continue
 
         total_divisions_found += len(matches)
@@ -611,7 +615,7 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
 # =========================================================================
 # STAGE 3: GEMINI SEARCH-GROUNDED JOURNALISTIC BRIEFING GENERATOR
 # =========================================================================
-def generate_missing_briefings(conn, limit: int = 25):
+def generate_missing_briefings(conn, limit: int = 30):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key or genai is None:
         log.info("GEMINI_API_KEY not set; skipping AI journalistic briefing generation.")
@@ -622,13 +626,13 @@ def generate_missing_briefings(conn, limit: int = 25):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT d.id, d.title, d.minute_ref, d.outcome, d.parsed_tallies,
+            SELECT d.id, d.title, d.minute_ref, d.outcome, d.expected_tallies, d.parsed_tallies,
                    m.meeting_date, a.name AS authority_name
             FROM divisions d
             JOIN meetings m ON m.id = d.meeting_id
             JOIN authorities a ON a.ons_code = m.authority_ons_code
             LEFT JOIN briefings b ON b.division_id = d.id
-            WHERE d.status = 'verified' AND b.division_id IS NULL
+            WHERE d.status IN ('verified', 'needs_review') AND b.division_id IS NULL
             ORDER BY m.meeting_date DESC
             LIMIT %s
             """,
@@ -637,7 +641,7 @@ def generate_missing_briefings(conn, limit: int = 25):
         pending = cur.fetchall()
 
     if not pending:
-        log.info("All verified divisions already have journalistic briefings.")
+        log.info("All extracted divisions already have journalistic briefings.")
         return
 
     log.info(f"Generating Google Search-grounded journalistic briefings for {len(pending)} division(s)...")
@@ -663,7 +667,7 @@ Authority: {div['authority_name']}
 Meeting Date: {div['meeting_date']} (Minute {div['minute_ref']})
 Motion Title: {div['title']}
 Outcome: {div['outcome']}
-Tallies: {json.dumps(div['parsed_tallies'])}
+Tallies: {json.dumps(div['expected_tallies'])}
 Party Whip Deviations / Rebels: {', '.join(rebels) if rebels else 'None'}
 
 Return ONLY a valid JSON object (no markdown fences) with these exact 5 keys in objective British English:
