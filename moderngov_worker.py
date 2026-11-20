@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 UK COUNCIL VOTEWATCH — AUTOMATED MODERN.GOV INGESTION PIPELINE
-1. sync-roster        -> Syncs councillors & date-stamped tenures via Modern.Gov XML/HTML
-2. crawl-divisions    -> Pulls 2019–2026 Council meetings & minutes via Modern.Gov XML + PDF/HTML
+1. sync-roster        -> Syncs councillors & date-stamped tenures via Modern.Gov XML
+2. crawl-divisions    -> Pulls 2019–2026 Council meetings & minutes via Modern.Gov XML + PDF fallback
 3. generate-briefings -> Generates 4-part journalistic briefings with Google Search grounding
 4. full-sync          -> Runs all three stages sequentially
 """
@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -69,7 +70,6 @@ def get_db_connection():
 
 
 def normalize_ward_key(name: str) -> str:
-    """Strips trailing 'Ward' and apostrophes so 'Belfairs Ward' == 'Belfairs' and 'St Lukes Ward' == 'St Luke's'."""
     s = (name or "").lower().replace("’", "").replace("'", "").strip()
     s = re.sub(r"\s+ward$", "", s).strip()
     return s
@@ -174,7 +174,6 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
     xml_url = f"{base_url}/mgWebService.asmx/GetCouncillorsByWard"
     try:
         resp = session.get(xml_url, timeout=30)
-        log.info(f"[{ons_code}] XML GetCouncillorsByWard status: HTTP {resp.status_code}")
         if resp.status_code == 200 and b"<" in resp.content:
             councillors_data = parse_moderngov_xml_councillors(resp.content)
             log.info(f"[{ons_code}] Retrieved {len(councillors_data)} councillors via Modern.Gov XML API.")
@@ -196,7 +195,7 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
             ward_key = normalize_ward_key(item["ward_name"])
             ward_id = ward_lookup.get(ward_key)
             if not ward_id:
-                log.warning(f"[{ons_code}] Unmapped ward '{item['ward_name']}' (key='{ward_key}') for {item['canonical_name']}")
+                log.warning(f"[{ons_code}] Unmapped ward '{item['ward_name']}' for {item['canonical_name']}")
                 continue
 
             cms_id = item["external_cms_id"]
@@ -256,14 +255,16 @@ def sync_authority_roster(conn, session: cffi_requests.Session, authority: Dict[
 
 
 # =========================================================================
-# STAGE 2: 2019–2026 MINUTES CRAWLER (XML WEB SERVICE + PDF/HTML FALLBACK)
+# STAGE 2: 2019–2026 MINUTES CRAWLER & RECORDED DIVISION PARSER
 # =========================================================================
+# Matches both 'Councillors' and 'Cllrs', inline or multi-line, with or without count in header
 DIVISION_BLOCK_REGEX = re.compile(
-    r"(For\s*:\s*Councillors?.*?)\n+"
-    r"(Against\s*:\s*Councillors?.*?)\n+"
-    r"(Abst(?:entions|ain)\s*:.*?)(?:\n+"
-    r"(No\s+Vote\s*:.*?))?(?:\n+"
-    r"(Absent(?:\s+for\s+the\s+vote)?\s*:.*?))?(?=\n\n|\Z)",
+    r"((?:Votes\s+)?For(?:\s*\(\d+\))?\s*:?\s*(?:Councillors?|Cllrs?)\b.*?)\n+"
+    r"((?:Votes\s+)?Against(?:\s*\(\d+\))?\s*:?\s*(?:Councillors?|Cllrs?|None|Nil)\b.*?)\n+"
+    r"(Abst(?:entions?|ain)(?:\s*\(\d+\))?\s*:?\s*.*?)"
+    r"(?:\n+(No\s+Vote(?:\s*\(\d+\))?\s*:?\s*.*?))?"
+    r"(?:\n+(Absent(?:\s+for\s+the\s+vote)?(?:\s*\(\d+\))?\s*:?\s*.*?))?"
+    r"(?=\n\n|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -272,9 +273,18 @@ def parse_bucket_line(line: str) -> Tuple[List[str], Optional[int]]:
     if not line:
         return ([], 0)
     flat = re.sub(r"\s+", " ", line).strip()
-    m_count = re.search(r"\((\d+)\)\s*\.?\s*$", flat)
-    expected = int(m_count.group(1)) if m_count else None
-    body = re.sub(r"^(For|Against|Abstentions|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)\s*:\s*", "", flat, flags=re.I)
+
+    # Check tally either at start "For (26):" or end "... (26)"
+    m_head_cnt = re.match(r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)\s*\((\d+)\)", flat, flags=re.I)
+    m_tail_cnt = re.search(r"\((\d+)\)\s*\.?\s*$", flat)
+    expected = int(m_head_cnt.group(1)) if m_head_cnt else (int(m_tail_cnt.group(1)) if m_tail_cnt else None)
+
+    body = re.sub(
+        r"^(?:Votes\s+)?(?:For|Against|Abstentions?|Abstain|No\s+Vote|Absent(?:\s+for\s+the\s+vote)?)(?:\s*\(\d+\))?\s*:?\s*",
+        "",
+        flat,
+        flags=re.I,
+    )
     body = re.sub(r"\((\d+)\)\s*\.?\s*$", "", body).strip()
     body = re.sub(r"^(Councillors|Councillor|Cllrs|Cllr)\s+", "", body, flags=re.I).strip()
 
@@ -314,7 +324,6 @@ def parse_flexible_date(raw_dt: str) -> Optional[date]:
 
 
 def fetch_meetings_via_xml(session: cffi_requests.Session, base_url: str, cids: List[int], start_year: int, end_year: int) -> List[Dict[str, Any]]:
-    """Uses Modern.Gov /mgWebService.asmx/GetMeetings (bypasses HTML page WAF)."""
     meetings = {}
     s_from = f"01/01/{start_year}"
     s_to = f"31/12/{end_year}"
@@ -323,7 +332,6 @@ def fetch_meetings_via_xml(session: cffi_requests.Session, base_url: str, cids: 
         url = f"{base_url}/mgWebService.asmx/GetMeetings?lCommitteeId={cid}&sFromDate={s_from}&sToDate={s_to}"
         try:
             resp = session.get(url, timeout=30)
-            log.info(f"XML GetMeetings (CId={cid}) status: HTTP {resp.status_code}")
             if resp.status_code != 200 or b"<" not in resp.content:
                 continue
             root = strip_xml_namespaces(resp.content)
@@ -345,38 +353,60 @@ def fetch_meetings_via_xml(session: cffi_requests.Session, base_url: str, cids: 
     return sorted(meetings.values(), key=lambda x: x["meeting_date"])
 
 
-def fetch_minutes_text_via_xml(session: cffi_requests.Session, base_url: str, mid: str) -> Tuple[str, Optional[str]]:
-    """Uses Modern.Gov /mgWebService.asmx/GetMeeting to extract inline minutes text & PDF links."""
+def fetch_single_meeting_minutes(base_url: str, mtg: Dict[str, Any]) -> Dict[str, Any]:
+    """Thread-safe worker to fetch GetMeeting XML (and PDF fallback if needed) for one meeting."""
+    session = create_http_session()
+    mid = mtg["mid"]
     url = f"{base_url}/mgWebService.asmx/GetMeeting?lMeetingId={mid}"
-    resp = session.get(url, timeout=30)
-    if resp.status_code != 200 or b"<" not in resp.content:
-        return ("", None)
-
-    root = strip_xml_namespaces(resp.content)
-    chunks = []
+    minutes_text = ""
     pdf_url = None
 
-    for item in root.findall(".//agendaitem"):
-        num = (item.findtext("agendaitemnumber") or "").strip()
-        title = (item.findtext("agendaitemtitle") or "").strip()
-        if num or title:
-            chunks.append(f"{num}. {title}".strip())
+    try:
+        resp = session.get(url, timeout=30)
+        if resp.status_code == 200 and b"<" in resp.content:
+            root = strip_xml_namespaces(resp.content)
+            chunks = []
 
-        raw_min = item.findtext("minutestext") or ""
-        if raw_min:
-            unescaped = html.unescape(raw_min)
-            plain = BeautifulSoup(unescaped, "html.parser").get_text("\n")
-            chunks.append(plain)
+            for item in root.findall(".//agendaitem"):
+                num = (item.findtext("agendaitemnumber") or "").strip()
+                title = (item.findtext("agendaitemtitle") or "").strip()
+                if num or title:
+                    chunks.append(f"{num}. {title}".strip())
 
-    for doc in root.findall(".//document"):
-        d_title = (doc.findtext("title") or "").lower()
-        d_url = (doc.findtext("url") or "").strip()
-        if d_url and ("minute" in d_title or "printed minutes" in d_title):
-            pdf_url = urljoin(base_url + "/", d_url)
-            break
+                # Capture all minute/decision/vote fields regardless of Modern.Gov XML schema version
+                for child in item:
+                    tag_low = child.tag.lower()
+                    if any(k in tag_low for k in ("minute", "decision", "vote", "text")) and child.text:
+                        unescaped = html.unescape(child.text)
+                        plain = BeautifulSoup(unescaped, "html.parser").get_text("\n")
+                        if plain.strip():
+                            chunks.append(plain.strip())
 
-    combined_text = "\n\n".join(c.strip() for c in chunks if c.strip())
-    return (combined_text, pdf_url)
+            for doc in root.findall(".//document"):
+                d_title = (doc.findtext("title") or "").lower()
+                d_url = (doc.findtext("url") or "").strip()
+                if d_url and ("minute" in d_title or "printed minutes" in d_title):
+                    pdf_url = urljoin(base_url + "/", d_url)
+                    break
+
+            minutes_text = "\n\n".join(chunks)
+
+        # Fallback to Minutes PDF if XML had no recorded division blocks
+        if (not minutes_text or not DIVISION_BLOCK_REGEX.search(minutes_text)) and pdf_url:
+            pdf_resp = session.get(pdf_url, timeout=45)
+            if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
+                minutes_text = extract_text_from_pdf(pdf_resp.content)
+
+    except Exception as exc:
+        log.warning(f"Fetch error on MId={mid}: {exc}")
+    finally:
+        session.close()
+
+    return {
+        "mtg": mtg,
+        "minutes_text": minutes_text,
+        "minutes_source_url": pdf_url or mtg["source_url"],
+    }
 
 
 def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: Dict[str, Any], start_year: int = 2019, end_year: int = 2026):
@@ -413,30 +443,40 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
 
     cids = KNOWN_COUNCIL_CIDS.get(ons_code, [131])
     meetings = fetch_meetings_via_xml(session, base_url, cids, start_year, end_year)
-    log.info(f"[{ons_code}] Found {len(meetings)} Council meetings ({start_year}–{end_year}).")
+    log.info(f"[{ons_code}] Scanning {len(meetings)} Council meetings ({start_year}–{end_year}) in parallel...")
 
-    for mtg in meetings:
+    fetched_results = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(fetch_single_meeting_minutes, base_url, m) for m in meetings]
+        for fut in as_completed(futures):
+            fetched_results.append(fut.result())
+
+    fetched_results.sort(key=lambda x: x["mtg"]["meeting_date"])
+    total_divisions_found = 0
+
+    for item in fetched_results:
+        mtg = item["mtg"]
         mid = mtg["mid"]
         meeting_dt = mtg["meeting_date"]
+        minutes_text = item["minutes_text"]
+        minutes_source_url = item["minutes_source_url"]
+
+        if not minutes_text:
+            continue
+
+        matches = list(DIVISION_BLOCK_REGEX.finditer(minutes_text))
+        if not matches:
+            # Log diagnostic snippet if a recorded vote phrase exists but didn't match regex
+            rv = re.search(r"(recorded vote|voting was as follows|for\s*:)", minutes_text, flags=re.I)
+            if rv and "against" in minutes_text[rv.start():rv.start() + 600].lower():
+                snippet = re.sub(r"\s+", " ", minutes_text[rv.start():rv.start() + 260])
+                log.info(f"[{ons_code}] {meeting_dt} (MId={mid}) unparsed vote sample: {snippet}")
+            continue
+
+        total_divisions_found += len(matches)
+        log.info(f"[{ons_code}] {meeting_dt} (MId={mid}): Detected {len(matches)} recorded division(s).")
+
         try:
-            minutes_text, pdf_url = fetch_minutes_text_via_xml(session, base_url, mid)
-            minutes_source_url = pdf_url or mtg["source_url"]
-
-            # If inline XML minutes didn't contain division lists, try downloading the Minutes PDF
-            if (not minutes_text or not DIVISION_BLOCK_REGEX.search(minutes_text)) and pdf_url:
-                pdf_resp = session.get(pdf_url, timeout=45)
-                if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
-                    minutes_text = extract_text_from_pdf(pdf_resp.content)
-
-            if not minutes_text:
-                continue
-
-            matches = list(DIVISION_BLOCK_REGEX.finditer(minutes_text))
-            if not matches:
-                continue
-
-            log.info(f"[{ons_code}] {meeting_dt} (MId={mid}): Detected {len(matches)} recorded division(s).")
-
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -563,7 +603,9 @@ def crawl_authority_divisions(conn, session: cffi_requests.Session, authority: D
             conn.commit()
         except Exception as exc:
             conn.rollback()
-            log.warning(f"[{ons_code}] Error processing MId={mid}: {exc}")
+            log.warning(f"[{ons_code}] Error saving MId={mid}: {exc}")
+
+    log.info(f"[{ons_code}] Finished crawl: {total_divisions_found} recorded division(s) extracted.")
 
 
 # =========================================================================
